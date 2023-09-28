@@ -1,14 +1,17 @@
 import inspect
 import logging
 import typing
-from typing import Any, Callable, Dict, List, Type, Union
+from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
 import pandas as pd
 
 from hamilton import models, node
 from hamilton.dev_utils.deprecation import deprecated
 from hamilton.function_modifiers import base
+from hamilton.function_modifiers.base import NodeInjector
+from hamilton.function_modifiers.configuration import ConfigResolver
 from hamilton.function_modifiers.delayed import resolve as delayed_resolve
+from hamilton.function_modifiers.dependencies import SingleDependency
 
 logger = logging.getLogger(__name__)
 
@@ -289,3 +292,86 @@ class model(dynamic_transform):
         super(model, self).__init__(
             transform_cls=model_cls, config_param=config_param, **extra_model_params
         )
+
+
+class Applicable:
+    resolvers: List[ConfigResolver]
+
+    def __init__(self, fn: Callable, **kwargs: Union[Any, SingleDependency]):
+        self.fn = fn
+        self.kwargs = kwargs
+        self.resolvers = []
+
+    def when(self, **key_value_pairs) -> "Applicable":
+        return Applicable(
+            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when(**key_value_pairs)]
+        )
+
+    def when_not(self, **key_value_pairs) -> "Applicable":
+        return Applicable(
+            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_not(**key_value_pairs)]
+        )
+
+    def when_in(self, **key_value_group_pairs: list) -> "Applicable":
+        return Applicable(
+            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)]
+        )
+
+    def when_not_in(self, **key_value_group_pairs: list) -> "Applicable":
+        return Applicable(
+            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)]
+        )
+
+
+def apply(fn) -> Applicable:
+    return Applicable(fn=fn, resolvers=[])
+
+
+class pipe(NodeInjector):
+    def __init__(self, *apply: Applicable, group_as_one_node=True):
+        self.apply = apply
+        self.group_as_one_node = group_as_one_node
+
+    def inject_nodes(
+        self, params: Dict[str, Type[Type]], config: Dict[str, Any], fn: Callable
+    ) -> Tuple[List[node.Node], Dict[str, str]]:
+        sig = inspect.signature(fn)
+        first_parameter = list(sig.parameters.values())[0]
+        # use the name of the parameter to determine the first node
+        # Then wire them all through in order
+        # if it resolves, great
+        # if not, skip that, pointing to the previous
+        # Create a node along the way
+        if first_parameter not in params:
+            raise base.InvalidDecoratorException(
+                f"Function: {fn.__name__} has a first parameter that is not a dependency. "
+                f"@pipe requires the parameter names to match the function parameters. "
+                f"Thus it might not be compatible with some other decorators"
+            )
+
+    def validate(self, fn: Callable):
+        pass
+
+
+def _add_one(v: int) -> int:
+    return v + 1
+
+
+def _add_two(v: int) -> int:
+    return v + 2
+
+
+def _add_n(v: int, n: int) -> int:
+    return v + n
+
+
+# @pipe(
+#     apply(_add_one).when_not(foo="bar"),
+#     apply(_add_two),
+#     apply(_add_n, n3).when_in(foo=["bar", "baz"]),
+#     apply(_add_n, n=source("foo")).when_in(foo=["bar", "baz"]),
+#     apply(_add_two),
+# )
+# def chain_of_additions(v: int) -> int:
+#     print(v)
+#     return v
