@@ -1,6 +1,7 @@
 import inspect
 import logging
 import typing
+from collections import Counter
 from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
 import pandas as pd
@@ -11,7 +12,11 @@ from hamilton.function_modifiers import base
 from hamilton.function_modifiers.base import NodeInjector
 from hamilton.function_modifiers.configuration import ConfigResolver
 from hamilton.function_modifiers.delayed import resolve as delayed_resolve
-from hamilton.function_modifiers.dependencies import SingleDependency
+from hamilton.function_modifiers.dependencies import (
+    LiteralDependency,
+    SingleDependency,
+    UpstreamDependency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -295,40 +300,73 @@ class model(dynamic_transform):
 
 
 class Applicable:
-    resolvers: List[ConfigResolver]
-
-    def __init__(self, fn: Callable, **kwargs: Union[Any, SingleDependency]):
+    def __init__(
+        self,
+        fn: Callable,
+        resolvers: List[ConfigResolver] = None,
+        __name: str = None,
+        **kwargs: Union[Any, SingleDependency],
+    ):
         self.fn = fn
-        self.kwargs = kwargs
-        self.resolvers = []
+        print(kwargs, "kwargs", __name, "name")
+        self.kwargs = {key: value for key, value in kwargs.items() if key != "__name"}  # TODO --
+        # figure out why this was showing up in two places...
+        self.resolvers = resolvers if resolvers is not None else []
+        self.name = __name
 
     def when(self, **key_value_pairs) -> "Applicable":
         return Applicable(
-            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when(**key_value_pairs)]
+            fn=self.fn,
+            resolvers=self.resolvers + [ConfigResolver.when(**key_value_pairs)],
+            __name=self.name,
+            **self.kwargs,
         )
 
     def when_not(self, **key_value_pairs) -> "Applicable":
         return Applicable(
-            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_not(**key_value_pairs)]
+            fn=self.fn,
+            resolvers=self.resolvers + [ConfigResolver.when_not(**key_value_pairs)],
+            __name=self.name,
+            **self.kwargs,
         )
 
     def when_in(self, **key_value_group_pairs: list) -> "Applicable":
         return Applicable(
-            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)]
+            fn=self.fn,
+            resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)],
+            __name=self.name,
+            **self.kwargs,
         )
 
     def when_not_in(self, **key_value_group_pairs: list) -> "Applicable":
         return Applicable(
-            fn=self.fn, resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)]
+            fn=self.fn,
+            resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)],
+            __name=self.name,
+            **self.kwargs,
         )
 
+    def named(self, name: str) -> "Applicable":
+        return Applicable(
+            fn=self.fn,
+            resolvers=self.resolvers,
+            __name=name,
+            **self.kwargs,
+        )
 
-def apply(fn) -> Applicable:
-    return Applicable(fn=fn, resolvers=[])
+    def get_config_elements(self) -> List[str]:
+        out = []
+        for resolver in self.resolvers:
+            out.extend(resolver.optional_config)
+        return out
+
+
+def apply(fn, __name: typing.Optional[str] = None, **kwargs) -> Applicable:
+    return Applicable(fn=fn, resolvers=[], __name=__name, **kwargs)
 
 
 class pipe(NodeInjector):
-    def __init__(self, *apply: Applicable, group_as_one_node=True):
+    def __init__(self, *apply: Applicable, group_as_one_node=False):
         self.apply = apply
         self.group_as_one_node = group_as_one_node
 
@@ -336,7 +374,8 @@ class pipe(NodeInjector):
         self, params: Dict[str, Type[Type]], config: Dict[str, Any], fn: Callable
     ) -> Tuple[List[node.Node], Dict[str, str]]:
         sig = inspect.signature(fn)
-        first_parameter = list(sig.parameters.values())[0]
+        first_parameter = list(sig.parameters.values())[0].name
+        namespace = fn.__name__
         # use the name of the parameter to determine the first node
         # Then wire them all through in order
         # if it resolves, great
@@ -348,30 +387,77 @@ class pipe(NodeInjector):
                 f"@pipe requires the parameter names to match the function parameters. "
                 f"Thus it might not be compatible with some other decorators"
             )
+        current_param = first_parameter
+        fn_count = Counter()
+        nodes = []
+        for applicable in self.apply:
+            include = True
+            for resolver in applicable.resolvers:
+                if not resolver(config):
+                    include = False
+                    break
+            if include:
+                fn_name = applicable.fn.__name__
+                postfix = "" if fn_count[fn_name] == 0 else f"_{fn_count[fn_name]}"
+                node_name = (
+                    applicable.name
+                    if applicable.name is not None
+                    else f"with{('_' if not fn_name.startswith('_') else '') + fn_name}{postfix}"
+                )
+                raw_node = node.Node.from_fn(
+                    applicable.fn,
+                    f"with{('_' if not fn_name.startswith('_') else '') + fn_name}{postfix}",
+                )
+                raw_node = raw_node.copy_with(namespace=(namespace,), name=node_name)
+                # TODO -- validate that the first parameter is the right type/all the same
+                first_param = list(inspect.signature(fn).parameters.values())[0].name
+                fn_count[fn_name] += 1
+                upstream_inputs = {
+                    first_param: current_param
+                }  # reassign the first input to the pass-through
+                literal_inputs = {}
+                # TODO -- restrict to ensure that this covers *all* dependencies
+                for dep, value in applicable.kwargs.items():
+                    if isinstance(value, UpstreamDependency):
+                        upstream_inputs[dep] = value.source
+                    elif isinstance(value, LiteralDependency):
+                        literal_inputs[dep] = value.value
+                    else:
+                        literal_inputs[dep] = value
+                nodes.append(
+                    raw_node.reassign_inputs(
+                        input_names=upstream_inputs,
+                        input_values=literal_inputs,
+                    )
+                )
+                current_param = raw_node.name
+            # final_node = node.Node.from_fn(fn)
+            # final_node.reassign_inputs(
+            #     input_names={first_parameter: current_param},
+            # )
+            # nodes.append(final_node)
+        if self.group_as_one_node:
+            raise NotImplementedError("Grouping as one node is not yet implemented")
+        return nodes, {first_parameter: current_param}  # rename to ensure it all works
 
     def validate(self, fn: Callable):
         pass
 
+    def optional_config(self) -> Dict[str, Any]:
+        """Declares the optional configuration keys for this decorator.
+        These are configuration keys that can be used by the decorator, but are not required.
+        Along with these we have *defaults*, which we will use to pass to the config.
 
-def _add_one(v: int) -> int:
-    return v + 1
-
-
-def _add_two(v: int) -> int:
-    return v + 2
-
-
-def _add_n(v: int, n: int) -> int:
-    return v + n
-
-
-# @pipe(
-#     apply(_add_one).when_not(foo="bar"),
-#     apply(_add_two),
-#     apply(_add_n, n3).when_in(foo=["bar", "baz"]),
-#     apply(_add_n, n=source("foo")).when_in(foo=["bar", "baz"]),
-#     apply(_add_two),
-# )
-# def chain_of_additions(v: int) -> int:
-#     print(v)
-#     return v
+        :return: The optional configuration keys with defaults. Note that this will return None
+        if we have no idea what they are, which bypasses the configuration filtering we use entirely.
+        This is mainly for the legacy API.
+        """
+        out = {}
+        for applicable in self.apply:
+            for resolver in applicable.resolvers:
+                out.update(resolver.optional_config)
+        return out
+        # out = []
+        # for resolver in self.apply:
+        #     out += resolver.get_config_elements()
+        # return list(set(out))

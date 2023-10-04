@@ -12,8 +12,8 @@ class ConfigResolver:
         self._config_used = config_used
 
     @property
-    def required_config(self) -> List[str]:
-        return self._config_used
+    def optional_config(self) -> Dict[str, Any]:
+        return {key: None for key in self._config_used}
 
     def __call__(self, config: Dict[str, Any]) -> bool:
         return self.resolves(config)
@@ -212,7 +212,7 @@ class config(base.NodeResolver):
         :return: a configuration decorator
         """
         resolver = ConfigResolver.when(name=name, **key_value_pairs)
-        return config(resolver, target_name=name, config_used=resolver.required_config)
+        return config(resolver, target_name=name, config_used=list(resolver.optional_config))
 
     @staticmethod
     def when_not(name=None, **key_value_pairs: Any) -> "config":
@@ -225,7 +225,7 @@ class config(base.NodeResolver):
         """
 
         resolver = ConfigResolver.when_not(name=name, **key_value_pairs)
-        return config(resolver, target_name=name, config_used=resolver.required_config)
+        return config(resolver, target_name=name, config_used=list(resolver.optional_config))
 
     @staticmethod
     def when_in(name=None, **key_value_group_pairs: Collection[Any]) -> "config":
@@ -240,7 +240,7 @@ class config(base.NodeResolver):
         """
 
         resolver = ConfigResolver.when_in(name=name, **key_value_group_pairs)
-        return config(resolver, target_name=name, config_used=resolver.required_config)
+        return config(resolver, target_name=name, config_used=list(resolver.optional_config))
 
     @staticmethod
     def when_not_in(**key_value_group_pairs: Collection[Any]) -> "config":
@@ -268,4 +268,4 @@ class config(base.NodeResolver):
         """
 
         resolver = ConfigResolver.when_not_in(**key_value_group_pairs)
-        return config(resolver, config_used=resolver.required_config)
+        return config(resolver, config_used=list(resolver.optional_config))
