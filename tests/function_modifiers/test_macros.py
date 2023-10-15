@@ -5,9 +5,10 @@ import pandas as pd
 import pytest
 
 import hamilton.function_modifiers
-from hamilton import function_modifiers, models
+from hamilton import function_modifiers, models, node
 from hamilton.function_modifiers import does
-from hamilton.function_modifiers.macros import ensure_function_empty
+from hamilton.function_modifiers.dependencies import source, value
+from hamilton.function_modifiers.macros import Applicable, apply, ensure_function_empty, pipe
 from hamilton.node import DependencyType
 
 
@@ -221,3 +222,94 @@ def test_model_modifier():
 
     with pytest.raises(hamilton.function_modifiers.base.InvalidDecoratorException):
         annotation.validate(bad_model)
+
+
+def _test_apply_function(foo: int, bar: int, baz: int = 100) -> int:
+    return foo + bar + baz
+
+
+def _test_apply_function_2(foo: int) -> int:
+    return foo + 1
+
+
+@pytest.mark.parametrize(
+    "args,kwargs,chain_first_param",
+    [
+        ([source("foo_upstream"), value(1)], {}, False),
+        ([value(1)], {}, True),
+        ([source("foo_upstream"), value(1), value(2)], {}, False),
+        ([value(1), value(2)], {}, True),
+        ([source("foo_upstream")], {"bar": value(1)}, False),
+        ([], {"bar": value(1)}, True),
+        ([], {"foo": source("foo_upstream"), "bar": value(1)}, False),
+        ([], {"bar": value(1)}, True),
+        ([], {"foo": source("foo_upstream"), "bar": value(1), "baz": value(1)}, False),
+        ([], {"bar": value(1), "baz": value(1)}, True),
+    ],
+)
+def test_applicable_validates_correctly(args, kwargs, chain_first_param: bool):
+    applicable = Applicable(_test_apply_function, *args, **kwargs)
+    applicable.validate(chain_first_param=chain_first_param)
+
+
+@pytest.mark.parametrize(
+    "args,kwargs,chain_first_param",
+    [
+        (
+            [source("foo_upstream"), value(1)],
+            {"foo": source("foo_upstream")},
+            True,
+        ),  # We chain the first parameter, not pass it in
+        ([value(1)], {}, False),  # Not enough first parameters
+        ([source("foo_upstream"), value(1), value(2)], {}, True),
+        ([value(2)], {"foo": source("foo_upstream")}, False),
+        ([source("foo_upstream")], {"bar": value(1)}, True),
+        ([], {"bar": value(1)}, False),
+        ([], {"foo": source("foo_upstream"), "bar": value(1)}, True),
+        ([], {"bar": value(1)}, False),
+        ([], {"foo": source("foo_upstream"), "bar": value(1), "baz": value(1)}, True),
+        ([], {"bar": value(1), "baz": value(1)}, False),
+    ],
+)
+def test_applicable_does_not_validate(args, kwargs, chain_first_param: bool):
+    with pytest.raises(hamilton.function_modifiers.base.InvalidDecoratorException):
+        applicable = Applicable(_test_apply_function, *args, **kwargs)
+        applicable.validate(chain_first_param=chain_first_param)
+
+
+def general_downstream_function(result: int) -> int:
+    return result
+
+
+def test_pipe_decorator_no_collapse_single_node():
+    n = node.Node.from_fn(general_downstream_function)
+
+    decorator = pipe(
+        apply(_test_apply_function, bar=source("bar_upstream"), baz=value(1000)).named("node_1"),
+    )
+    nodes = decorator.transform_dag([n], {}, general_downstream_function)
+    nodes_by_name = {item.name: item for item in nodes}
+    chain_node = nodes_by_name["node_1"]
+    assert chain_node(result=1, bar_upstream=10) == 1011  # This chains it through
+    assert sorted(chain_node.input_types) == ["bar_upstream", "result"]
+    final_node = nodes_by_name["general_downstream_function"]
+    assert final_node(node_1=1) == 1
+
+    # It should take in the value result, and cascade it through to this
+    # result -> "1" -> general_downstream_function
+
+
+def test_pipe_decorator_no_collapse_multi_node():
+    n = node.Node.from_fn(general_downstream_function)
+
+    decorator = pipe(
+        apply(_test_apply_function, bar=source("bar_upstream"), baz=100).named("node_1"),
+        apply(_test_apply_function, bar=value(10), baz=value(100)).named("node_2"),
+    )
+    nodes = decorator.transform_dag([n], {}, general_downstream_function)
+    nodes_by_name = {item.name: item for item in nodes}
+    final_node = nodes_by_name["general_downstream_function"]
+    assert len(nodes_by_name) == 3
+    assert nodes_by_name["node_1"](result=1, bar_upstream=10) == 111
+    assert nodes_by_name["node_2"](node_1=1) == 111
+    assert final_node(node_2=100) == 100

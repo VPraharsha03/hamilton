@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 """Decorators that replace a function's execution with specified behavior"""
 
+# Python 3.10 + has this built in, otherwise we have to define it
+try:
+    from types import EllipsisType
+except ImportError:
+    EllipsisType = type(...)
+
 
 # the following are empty functions that we can compare against to ensure that @does uses an empty function
 def _empty_function():
@@ -303,54 +309,65 @@ class Applicable:
     def __init__(
         self,
         fn: Callable,
-        resolvers: List[ConfigResolver] = None,
-        __name: str = None,
+        *args: Union[Any, SingleDependency],
+        _resolvers: List[ConfigResolver] = None,
+        _name: typing.Optional[str] = None,
+        _namespace: Union[str, None, EllipsisType] = ...,
         **kwargs: Union[Any, SingleDependency],
     ):
         self.fn = fn
-        print(kwargs, "kwargs", __name, "name")
+        if "_name" in kwargs:
+            raise ValueError("Cannot pass in _name as a kwarg")
+
         self.kwargs = {key: value for key, value in kwargs.items() if key != "__name"}  # TODO --
+        self.args = args
         # figure out why this was showing up in two places...
-        self.resolvers = resolvers if resolvers is not None else []
-        self.name = __name
+        self.resolvers = _resolvers if _resolvers is not None else []
+        self.name = _name
+        self.namespace = _namespace
+
+    def _with_resolvers(self, *additional_resolvers: ConfigResolver) -> "Applicable":
+        return Applicable(
+            fn=self.fn,
+            _resolvers=self.resolvers + list(additional_resolvers),
+            _name=self.name,
+            _namespace=self.namespace,
+            *self.args,
+            **self.kwargs,
+        )
 
     def when(self, **key_value_pairs) -> "Applicable":
-        return Applicable(
-            fn=self.fn,
-            resolvers=self.resolvers + [ConfigResolver.when(**key_value_pairs)],
-            __name=self.name,
-            **self.kwargs,
-        )
+        return self._with_resolvers(ConfigResolver.when(**key_value_pairs))
 
     def when_not(self, **key_value_pairs) -> "Applicable":
-        return Applicable(
-            fn=self.fn,
-            resolvers=self.resolvers + [ConfigResolver.when_not(**key_value_pairs)],
-            __name=self.name,
-            **self.kwargs,
-        )
+        return self._with_resolvers(ConfigResolver.when_not(**key_value_pairs))
 
     def when_in(self, **key_value_group_pairs: list) -> "Applicable":
-        return Applicable(
-            fn=self.fn,
-            resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)],
-            __name=self.name,
-            **self.kwargs,
-        )
+        return self._with_resolvers(ConfigResolver.when_in(**key_value_group_pairs))
 
     def when_not_in(self, **key_value_group_pairs: list) -> "Applicable":
-        return Applicable(
-            fn=self.fn,
-            resolvers=self.resolvers + [ConfigResolver.when_in(**key_value_group_pairs)],
-            __name=self.name,
-            **self.kwargs,
-        )
+        return self._with_resolvers(ConfigResolver.when_not_in(**key_value_group_pairs))
 
-    def named(self, name: str) -> "Applicable":
+    def named(self, name: str, namespace: Union[str, EllipsisType] = None) -> "Applicable":
+        """Names the function application. This has the following rules:
+        1. The name will be the name passed in, this is required
+        2. If the namespace is `None`, then there will be no namespace
+        3. If the namespace is `...`, then the namespace will be the namespace that already exists, usually the name of the
+        function that this is decorating. This is an odd case -- but it helps if you have
+        multiple of the same type of operations that you want to apply across different nodes,
+        or in the case of a parameterization (which is not yet supported).
+
+        :param name: Name of the node to be created
+        :param namespace: Namespace of the node to be created -- currently only single-level namespaces are supported
+        :return: The applicable with the new name
+        """
         return Applicable(
             fn=self.fn,
-            resolvers=self.resolvers,
-            __name=name,
+            _resolvers=self.resolvers,
+            _name=name,
+            _namespace=None
+            if namespace is None
+            else (namespace if namespace is not ... else self.namespace),
             **self.kwargs,
         )
 
@@ -360,15 +377,41 @@ class Applicable:
             out.extend(resolver.optional_config)
         return out
 
+    def validate(self, chain_first_param: bool = False):
+        """Validates that the Applicable function can be applied given the
+        set of kwargs passed in. This says that:
+        1. The signature binds appropriately
+        2. If we chain the first parameter, it is not present in the function
 
-def apply(fn, __name: typing.Optional[str] = None, **kwargs) -> Applicable:
-    return Applicable(fn=fn, resolvers=[], __name=__name, **kwargs)
+        :param kwargs: Kwargs to use, will be either literals or SingleDependency
+        :param chain_first_parameter: Whether we chain the first parameter
+        :raises InvalidDecoratorException if the function cannot be applied
+        :return:
+        """
+        args = ((...,) if chain_first_param else ()) + self.args  # dummy argument at first
+        sig = inspect.signature(self.fn)
+        try:
+            sig.bind(*args, **self.kwargs)
+        except TypeError as e:
+            raise base.InvalidDecoratorException(
+                f"Function: {self.fn.__name__} cannot be applied with the following args: {self.args} "
+                f"and the following kwargs: {self.kwargs}"
+            ) from e
+        if len(sig.parameters) == 0:
+            raise base.InvalidDecoratorException(
+                f"Function: {self.fn.__name__} has no parameters. "
+                f"You cannot apply a function with no parameters."
+            )
+
+
+def apply(fn, _name: typing.Optional[str] = None, **kwargs) -> Applicable:
+    return Applicable(fn=fn, _resolvers=[], _name=_name, _namespace=..., **kwargs)
 
 
 class pipe(NodeInjector):
-    def __init__(self, *apply: Applicable, group_as_one_node=False):
+    def __init__(self, *apply: Applicable, collapse=False):
         self.apply = apply
-        self.group_as_one_node = group_as_one_node
+        self.collapse = collapse
 
     def inject_nodes(
         self, params: Dict[str, Type[Type]], config: Dict[str, Any], fn: Callable
@@ -408,9 +451,16 @@ class pipe(NodeInjector):
                     applicable.fn,
                     f"with{('_' if not fn_name.startswith('_') else '') + fn_name}{postfix}",
                 )
-                raw_node = raw_node.copy_with(namespace=(namespace,), name=node_name)
+                node_namespace = (
+                    (namespace,)
+                    if applicable.namespace is ...
+                    else (applicable.namespace,)
+                    if applicable.namespace is not None
+                    else ()
+                )
+                raw_node = raw_node.copy_with(namespace=node_namespace, name=node_name)
                 # TODO -- validate that the first parameter is the right type/all the same
-                first_param = list(inspect.signature(fn).parameters.values())[0].name
+                first_param = list(inspect.signature(applicable.fn).parameters.values())[0].name
                 fn_count[fn_name] += 1
                 upstream_inputs = {
                     first_param: current_param
@@ -431,17 +481,15 @@ class pipe(NodeInjector):
                     )
                 )
                 current_param = raw_node.name
-            # final_node = node.Node.from_fn(fn)
-            # final_node.reassign_inputs(
-            #     input_names={first_parameter: current_param},
-            # )
-            # nodes.append(final_node)
-        if self.group_as_one_node:
-            raise NotImplementedError("Grouping as one node is not yet implemented")
+        if self.collapse:
+            raise NotImplementedError(
+                "Collapsing apply() functions as one node is not yet implemented"
+            )
         return nodes, {first_parameter: current_param}  # rename to ensure it all works
 
     def validate(self, fn: Callable):
-        pass
+        for applicable in self.apply:
+            applicable.validate(chain_first_param=True)
 
     def optional_config(self) -> Dict[str, Any]:
         """Declares the optional configuration keys for this decorator.
@@ -461,3 +509,7 @@ class pipe(NodeInjector):
         # for resolver in self.apply:
         #     out += resolver.get_config_elements()
         # return list(set(out))
+
+
+class flow(pipe):
+    pass
